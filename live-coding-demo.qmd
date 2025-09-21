@@ -1,0 +1,664 @@
+---
+title: "Location Extraction from News Articles, using R and Python"
+author: "Simona Bisiani"
+format: html
+execute:
+  eval: false
+  echo: true
+editor: visual
+---
+
+## Introduction
+
+Welcome to this live coding demonstration exploring **LLMs for Toponym Disambiguation** in UK local media. We will be using [LMUK-Geo](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/SGVXIU), a benchmark dataset we annotated for the purpose of testing geoparsing methods on British local news articles. We'll do the following:
+
+-   toponym recognition using *spaCy* in Python, to extract locations
+
+-   candidate retrieval, to find real world candidates, using *OpenStreetMap Nominatim API*
+
+-   toponym resolution with *Ollama* and gemma2-9b model, to disambiguate
+
+As such, you'll get an overview of the full geoparsing pipeline, and get a sense of popular frameworks and common challenges.
+
+#### Setup: Loading Libraries
+
+Let's start by loading our libraries:
+
+```{r setup}
+#| eval: false
+#| message: false
+#| warning: false
+
+# Load R libraries
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(reticulate)  # For Python integration
+  library(httr2)       # For API calls
+  library(jsonlite)    # For JSON handling
+  library(glue)        # For string templating
+  library(DT)          # For interactive tables
+  library(maps)
+})
+
+# use_virtualenv(".venv/")
+use_virtualenv('.venv-mac/')
+# py_install("pandas")
+# py_install('spacy[transformers]')
+# system("python -m spacy download en_core_web_sm")
+```
+
+```{python libraries}
+import pandas as pd
+import numpy as np
+import ast
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore")
+```
+
+------------------------------------------------------------------------
+
+## Dataset
+
+Let's examine our benchmark dataset:
+
+```{r gold-data-overview}
+#| message: false
+#| warning: false
+#| fig-cap: "Distribution of locations inside the LMUK-Geo dataset"
+#| column: margin
+
+gold_data = read_csv('data/LMUK-Geo.csv')
+gold_data |> glimpse()
+# gold_data |> select(doc) |> n_distinct()
+# gold_data |> select(domain) |> n_distinct()
+
+ggplot() + 
+  geom_polygon(data = map_data('world'), 
+  aes(x = long, y = lat, group = group), 
+  fill = 'gray90', 
+  color = 'black') + 
+  coord_fixed(xlim = c(-10,3), 
+              ylim = c(50.3, 59))+
+  geom_point(data = gold_data, 
+  aes(x = Longitude, y = Latitude, color = domain), 
+  size = 2.5, alpha = 0.2) +
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+
+------------------------------------------------------------------------
+
+## Toponym Recognition using spaCy
+
+Remember toponym recognition? The idea that, given some text, we extract the locations inside of it. Toponym recognition is a subset of Named Entity Recognition (NER), and, like NER, it's done in 3 ways: rules, learning, or hybrid. *Rules* consists of matching some patterns in the text. For example, anything matching the pattern 'City of' and the next word, or a word followed by 'Street', or 'Boulevard'.
+
+```{r NER-rule}
+# Sample text with locations
+text <- "I traveled from the City of Boston to New York, walking down Main Street and Broadway Boulevard. Then I visited Paris, France and returned to Los Angeles County."
+
+# Define simple patterns for location recognition
+patterns <- c(
+  "City of \\w+",           # City of [name]
+  "\\w+ Street",            # [name] Street  
+  "\\w+ Boulevard",         # [name] Boulevard
+  "\\w+ County",            # [name] County
+  "\\w+, \\w+"             # [City], [State/Country]
+)
+
+# Extract locations using pattern matching
+locations <- c()
+for(pattern in patterns) {
+  matches <- regmatches(text, gregexpr(pattern, text, perl = TRUE))[[1]]
+  locations <- c(locations, matches)
+}
+
+# Remove duplicates and display results
+unique_locations <- unique(locations)
+print(unique_locations)
+```
+
+The issue with rules is that to capture all instances you need a lot of them. The more rules you have the more false positives you will also have. Luckily, *learning-based* systems do a pretty good job nowadays. Sometimes researchers find it helpful to mix rules and learning-based methods, and thus this category is called *hybrid*. Learning-based NER trains machine learning models on large annotated datasets where humans have labeled entities like persons, locations, and organizations, allowing the system to automatically recognize similar patterns in new text without hand-crafted rules. [spaCy](https://spacy.io/usage) NER is a popular Python library that provides pre-trained neural network models for named entity recognition, offering out-of-the-box entity extraction in multiple languages with high accuracy and the ability to customize models for specific domains.
+
+There are multiple models offered by spaCy, and which to choose mostly depends on where on the efficiency/accuracy spectrum you would like to be. In other words, how fast vs how correct. Sometimes, if your machine is not powerful enough, your choice might be driven by model size (guess: smaller = worse). You can check performances of various models by spaCy [on their website](images/clipboard-303220680.png)\](https://spacy.io/usage/facts-figures)
+
+```{python spacy-NER-test}
+import spacy
+from spacy import displacy
+
+articles = pd.read_csv('data/articles.csv')
+len(articles)
+articles.head()
+
+# measure time
+nlp = spacy.load("en_core_web_trf")  # Load the spaCy transformer model
+
+start = pd.Timestamp.now()
+doc = nlp(articles['article'][1])
+end = pd.Timestamp.now()
+print("Time taken:", end - start)
+
+entities = [(ent.text, ent.label_) for ent in doc.ents if ent.label_ == 'GPE']
+html = displacy.render(doc, style="ent")
+
+nlp = spacy.load("en_core_web_sm")  # Load the spaCy small model
+
+start = pd.Timestamp.now()
+doc = nlp(articles['article'][1])
+end = pd.Timestamp.now()
+print("Time taken:", end - start)
+
+entities = [(ent.text, ent.label_) for ent in doc.ents if ent.label_ == 'GPE']
+html1 = displacy.render(doc, style="ent")
+```
+
+We can display the results to get an intuitive understanding of what the NER model does.
+
+```{r}
+# Display the HTML from Python
+htmltools::HTML(py$html)
+htmltools::HTML(py$html1)
+```
+
+Let's now run these models on all our articles, and benchmark their performance against the gold annotation. The models look for three types of location entities:**GPE**: Geopolitical entities (countries, cities, states); **LOC**: Locations (mountains, water bodies, regions); **FAC**: Facilities (buildings, airports, highways). Each model's predictions are compred against the human-annotated *gold standard* using standard information retrieval metrics. We will define:
+
+-   **True Positives**: Geographic entities correctly identified by the model\
+-   **False Positives**: Non-geographic terms incorrectly identified as locations\
+-   **False Negatives**: Geographic entities that the model missed\
+
+and use these to calculate:
+
+**Precision** = TP / (TP + FP)\
+\> *Of all the entities the model identified as locations, what percentage were actually correct?*\
+High precision = low false alarm rate
+
+**Recall** = TP / (TP + FN)\
+\> *Of all the actual geographic entities in the text, what percentage did the model successfully find?*\
+High recall = low miss rate
+
+**F1 Score** = 2 × (Precision × Recall) / (Precision + Recall)\
+\> Harmonic mean that balances precision and recall.\
+\> Useful single metric when you need both high precision AND high recall.
+
+We will then produce a **comparison table** showing precision, recall, and F1 scores for both models, helping determine which performs better for toponym recognition tasks.
+
+```{python}
+# Load human-annotated gold standard data
+gold_df = pd.read_csv('data/gold_toponym_recognition.csv')
+
+# ------------------------------------------------------------
+# STEP 1: Parse the gold standard annotations
+# ------------------------------------------------------------
+# The entities_gold column contains string representations of dicts
+# We need to convert them to actual Python dictionaries
+
+def safe_literal_eval(x):
+    """Safely convert string to dictionary"""
+    if isinstance(x, dict):
+        return x
+    try:
+        return ast.literal_eval(x)
+    except (ValueError, SyntaxError):
+        return {}
+
+gold_df['entities_gold'] = gold_df['entities_gold'].apply(safe_literal_eval)
+
+# ------------------------------------------------------------
+# STEP 2: Extract entities using both spaCy models
+# ------------------------------------------------------------
+nlp_trf = spacy.load("en_core_web_trf")  # Transformer (accurate but slow)
+nlp_sm = spacy.load("en_core_web_sm")    # Small model (fast but less accurate)
+
+# We care about these location entity types:
+# GPE = Geopolitical entities (countries, cities, states)
+# LOC = Locations (mountains, water bodies, regions)  
+# FAC = Facilities (buildings, airports, highways)
+VALID_LABELS = {"LOC", "GPE", "FAC"}
+
+def extract_entities(text, nlp_model):
+    """Extract location entities from text using spaCy"""
+    doc = nlp_model(text)
+    return {
+        label: [ent.text.strip() for ent in doc.ents if ent.label_ == label]
+        for label in VALID_LABELS
+    }
+
+# Process all documents with both models
+trf_results = []
+sm_results = []
+
+for doc_text in tqdm(gold_df['doc'], desc="Processing documents"):
+    trf_results.append(extract_entities(doc_text, nlp_trf))
+    sm_results.append(extract_entities(doc_text, nlp_sm))
+
+# Add model predictions to dataframes
+gold_df['entities_trf'] = trf_results
+gold_df['entities_sm'] = sm_results
+# gold_df.to_csv('data/gold_with_predictions.csv', index=False)
+# ------------------------------------------------------------
+# STEP 3: Calculate performance metrics
+# ------------------------------------------------------------
+
+def evaluate_model(gold_entities, predicted_entities):
+    """
+    Compare predicted entities against gold standard.
+    Returns precision, recall, and F1 scores.
+    """
+    # Flatten all entity types into single lists and lowercase for fair comparison
+    gold_flat = []
+    pred_flat = []
+    
+    for entity_type in VALID_LABELS:
+        gold_flat.extend([e.lower() for e in gold_entities.get(entity_type, [])])
+        pred_flat.extend([e.lower() for e in predicted_entities.get(entity_type, [])])
+    
+    # Convert to sets for comparison
+    gold_set = set(gold_flat)
+    pred_set = set(pred_flat)
+    
+    # Calculate true positives, false positives, false negatives
+    tp = len(gold_set & pred_set)  # Correctly found
+    fp = len(pred_set - gold_set)  # Incorrectly found
+    fn = len(gold_set - pred_set)  # Missed
+    
+    return tp, fp, fn
+
+# Calculate metrics for each document
+trf_metrics = []
+sm_metrics = []
+
+for idx, row in gold_df.iterrows():
+    # Transformer model
+    tp, fp, fn = evaluate_model(row['entities_gold'], row['entities_trf'])
+    trf_metrics.append({'TP': tp, 'FP': fp, 'FN': fn})
+    
+    # Small model
+    tp, fp, fn = evaluate_model(row['entities_gold'], row['entities_sm'])
+    sm_metrics.append({'TP': tp, 'FP': fp, 'FN': fn})
+
+# ------------------------------------------------------------
+# STEP 4: Calculate overall performance 
+# ------------------------------------------------------------
+
+def calculate_micro_averaged_scores(metrics_list):
+    """Calculate overall precision, recall, and F1 across all documents"""
+    total_tp = sum(m['TP'] for m in metrics_list)
+    total_fp = sum(m['FP'] for m in metrics_list)
+    total_fn = sum(m['FN'] for m in metrics_list)
+    
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    return precision, recall, f1
+
+# Get final scores
+trf_precision, trf_recall, trf_f1 = calculate_micro_averaged_scores(trf_metrics)
+sm_precision, sm_recall, sm_f1 = calculate_micro_averaged_scores(sm_metrics)
+
+results = pd.DataFrame({
+    "Model": ["en_core_web_trf", "en_core_web_sm"],
+    "Precision": [trf_precision, sm_precision],
+    "Recall": [trf_recall, sm_recall],
+    "F1": [trf_f1, sm_f1]
+})
+
+results.round(3)
+```
+
+As we can see, the transformer model is highly superior (althought slower) to the small model. Just so you know, these represent the extremes of the spaCy spectrum and there are other models you could try.  Let's now save the toponyms extracted by our best model, to use in the next sections.
+
+```{python}
+long_data = []
+for idx, row in gold_df.iterrows():
+    for entity_type, entities in row['entities_trf'].items():
+        for entity in entities:
+            long_data.append({'doc_id': idx, 'doc': row['doc'], 'entity': entity})
+
+pd.DataFrame(long_data).to_csv('data/entities_long.csv', index=False)
+```
+
+------------------------------------------------------------------------
+
+## Candidate Retrieval
+
+For candidate retrieval, we will use [OpenStreetMap's Nominatim](https://nominatim.org/), an API service that fetches data from OSM's geographic knowledge database. We will use the tidygeocoder package in R, which provides a simple and consistent interface for geocoding and reverse geocoding using various services, including OSM Nominatim. It allows you to convert addresses or place names into geographic coordinates (latitude and longitude) and vice versa.
+
+Just so you know, another useful resource (for UK locations) is Ordnance Survey Open Names, a comprehensive database of place names, roads numbers and postcodes for Great Britain (but no Northern Ireland unfortunately): <https://www.ordnancesurvey.co.uk/products/os-open-names>. Downloading OS Open Names is very simple. From the platform you just click on your desired format and get the data for free. It's updated quarterly.
+
+    ![](images/clipboard-3609027799.png){width="358"}
+
+```{r}
+# Load data
+gold_df <- read_csv('data/entities_long.csv')
+unique_entities <- gold_df |>
+  select(entity) |>
+  distinct()
+# write_csv(unique_entities, 'data/unique_entities.csv')
+
+# OSM candidates (this will take around 8minutes for 470 entities)
+library(tidygeocoder)
+# unique_entities <- read_csv('data/unique_entities.csv')
+osm_candidates <- unique_entities |> 
+  geocode(entity, method = 'osm', lat = latitude , long = longitude, limit = 10, custom_query = list(countrycodes = "gb"), return_input = FALSE)
+write_csv(osm_candidates, 'data/osm_candidates.csv')
+```
+
+Before we move on to disambiguation let's calculate which district each coordinate falls into. This will help us later on in the disambiguation process.
+
+```{r}
+osm_candidates <- read_csv('data/osm_candidates.csv')
+library(sf)
+# Load UK districts shapefile
+uk_districts <- st_read("lad_boundaries/LAD_MAY_2024_UK_BFE.shp")
+uk_districts <- st_transform(uk_districts, crs = 4326)  # Ensure it's in WGS84
+
+# Convert OSM candidates to sf object
+osm_sf <- st_as_sf(osm_candidates |> drop_na(), coords = c("longitude", "latitude"), crs = 4326)
+
+# Perform spatial join to find which district each point falls into
+osm_with_districts <- st_join(osm_sf, uk_districts, join = st_within)
+osm_with_districts_cands <- osm_with_districts |> 
+  filter(!is.na(LAD24NM)) |> 
+  mutate(
+    longitude = st_coordinates(geometry)[,1],
+    latitude  = st_coordinates(geometry)[,2]
+  )
+
+write_csv(osm_with_districts_cands |> st_drop_geometry(), 'data/osm_candidates_with_districts.csv')
+```
+
+------------------------------------------------------------------------
+
+## Toponym Resolution
+
+### Ollama
+To use ollama in R, you can directly communicate with the local server using the `httr2` package, or you can use the `ellmer`, '[ollamar](https://hauselin.github.io/ollama-r/)' or 'rollama' packages which provide a convenient interface. Regardless, your first need install Ollama on your machine.
+
+If you choose the 'httr2' route, you can refer to the [Ollama API documentation](https://ollama.com/docs/api) for details on how to structure your requests. I also recommend this [blog post](https://tomsing1.github.io/blog/posts/vectorsearch/).
+
+```{r}
+# this is ellmer works
+chat <- ellmer::chat_ollama("Be terse", model = "gemma3:1b", echo = "none")
+chat$chat("who is Super Mario's best friend?")
+
+# it's longer code, but more robust over time with httr2
+httr2::request("http://localhost:11434") |> 
+  httr2::req_url_path("/api/generate") |>
+  httr2::req_headers("Content-Type" = "application/json") |>
+  httr2::req_body_json(
+    list(
+      model = "gemma3:1b",
+      prompt = "Who is Super Mario's best friend?",
+      stream = FALSE,
+      options = list(seed = 123)  # reproducible seed
+    )
+  ) |> 
+  httr2::req_perform() |> httr2::resp_body_json() |>
+    getElement("response")
+
+# a useful wrapper is ollamar, which hides this code behind a function
+ollamar::generate("gemma3:1b", "Who is Super Mario's best friend?", output = 'text')
+```
+
+### Experiment Setup
+Let's try setup an experiment where we query gemma3-1b to disambiguate a toponym. We will provide it with the context of the article where the toponym was found, and a list of candidates retrieved from the gazetteers. The model will then select the most likely candidate.
+
+```{r load-data}
+# merge back candidates with articles and entities
+gold_data <- read_csv('data/LMUK-Geo.csv')
+osm_with_districts_cands <- read_csv('data/osm_candidates_with_districts.csv')
+
+# now let's select a small sample of 10 articles to work with
+set.seed(42)
+sample_docs <- gold_data |> 
+  distinct(doc) |>            # make sure articles are unique
+  slice_sample(n = 10) |> 
+  pull(doc)                   # vector of 10 article texts
+
+# Step 2: keep all toponyms + candidates for those articles
+sample <- osm_with_districts_cands |> 
+  sf::st_drop_geometry() |>
+  group_by(address) |>
+  summarise(candidates = str_c(unique(LAD24NM), collapse = "; "), .groups = "drop") |>
+  left_join(gold_data, by = c("address" = "text")) |> 
+  filter(doc %in% sample_docs)
+  
+# Define temperatures to test
+temperatures <- as.character(c(0,1))
+data_expanded <- expand_grid(
+  temperature = temperatures, 
+  sample
+) |> 
+  mutate(model = 'gemma3:1b')
+```
+
+
+```{r experiments-setup}
+# Define experiments: which fields to include
+experiments <- list(
+  exp1 = c("Outlet coverage LAD", "Domain"),
+  exp2 = c("Domain")  # Only Domain
+)
+
+# Define prompt types
+prompt <- "The task is mapping an entity (a toponym) to the Local Authority District (LAD) in which it is situated. Your goal is to select the correct option from the list provided. Instructions:
+1. Review Entity and Article:
+- Identify the toponym (location name).
+- Read the article carefully to understand the context.
+Example:
+Entity: King's Head pub.
+Article: Incident outside the King's Head pub on Main Street, Guildford.
+Use surrounding text to infer the location (e.g., Guildford).
+
+2. Check Metadata where provided:
+- Domain: The publisher’s domain may provide geographic context.
+- Outlet coverage LAD: The Local Authority District covered by the outlet which published the article.
+- Other Entities: Other entities present in the same articles and their candidates.
+
+3. Select answer from options:
+Choose the correct answer from the options based on context.
+Options:
+- A list of applicable Districts, if any.
+- “LAD not in options” (choose if correct District is missing).
+- “Entity is not a location” if applicable.
+- “Entity is outside the UK” for non-UK locations.
+- “Entity spans across several districts (e.g., a region)“ for entities that are not specific to a single LAD (e.g., Wales, Sussex).
+- “Unsure” if uncertain.
+
+4. Generate Response:
+- Format your response as JSON:
+{
+  \'chosen_option\': \'Your choice\',
+  \'reasoning\': \'Your reasoning\'
+}"
+
+classification_question <- "Which of the options provided best represents the Local Authority District (LAD) for the entity provided, based on the context in the article? Ensure the response is strictly in JSON format with no additional text, explanations, or commentary outside of the JSON object. Match the JSON schema indicated. Example of output: {\'chosen_option\': \'Fife\', \'reasoning\': \'The article refers to a toponym situated in Fife.\'}"
+```
+
+```{r main-function}
+library(jsonlite)
+detach(package:maps, unload=TRUE)
+
+query_llm <- function(data, system_message, classification_question, included_fields = c("Outlet coverage LAD", "Domain")) {
+  # Create prompts for each row
+  prompts <- data_expanded %>%
+    rowwise() |> 
+    mutate(
+      test_prompt = glue(
+        "{prompt}\n",
+        "Entity: {address}\n\n",
+        "Article: {doc}\n\n",
+        if ("Outlet coverage LAD" %in% included_fields) {
+          "Outlet coverage LAD: {domain_lad}\n"
+        } else {
+          ""
+        },
+        if ("Domain" %in% included_fields) {
+          "Domain: {domain}\n"
+        } else {
+          ""
+        },
+        "Options: {candidates}\n",  # Fix: use candidates instead of options_str
+        "{classification_question}"
+      )
+    ) %>%
+    pull(test_prompt)
+  
+  # Create requests
+  reqs <- map2(prompts, data_expanded$temperature, function(prompt, temp) {  
+    httr2::request("http://localhost:11434") %>%
+      httr2::req_url_path("/api/generate") %>%
+      httr2::req_headers("Content-Type" = "application/json") %>%
+      httr2::req_body_json(list(
+        model = "gemma3:1b", 
+        prompt = prompt,
+        stream = FALSE,
+        format = "json",
+        keep_alive = "10s",
+        options = list(seed = 42, temperature = as.numeric(temp))  # Use temp parameter
+      ))
+  })
+  
+  # Make parallel requests
+  resps <- httr2::req_perform_parallel(reqs, on_error = "continue", progress = TRUE)
+  
+  # Process results
+  results <- purrr::map(resps, function(resp) {  # Use purrr::map explicitly
+    # Step 1: parse outer JSON
+    outer <- httr2::resp_body_json(resp)
+    # Step 2: parse inner 'response' JSON safely
+    parsed_inner <- tryCatch({
+      fromJSON(outer$response)
+    }, error = function(e) NULL)
+    tibble(
+      chosen_option = if (!is.null(parsed_inner)) parsed_inner$chosen_option else NA,
+      reasoning     = if (!is.null(parsed_inner)) parsed_inner$reasoning else NA
+    )
+  })
+  
+  # Combine into a single data frame
+  results_df <- bind_rows(results)
+  
+  # Bind with original data to preserve address, doc, and other fields
+  final_result <- bind_cols(
+    data %>% select(address, doc, everything()),  # Keep all original columns
+    results_df
+  )
+  
+  return(final_result)  # Don't forget to return the result!
+}
+
+# Simple iteration through experiments
+for (exp_name in names(experiments)) {
+  included_fields <- experiments[[exp_name]]
+  
+  # Run the query
+  result <- query_llm(
+    data = data_expanded,
+    system_message = prompt,
+    classification_question = classification_question,
+    included_fields = included_fields
+  )
+  write_csv(result, paste0("results_", exp_name, ".csv")) # Save results
+}
+
+results <- list(
+  exp1 = read_csv("results_exp1.csv"),
+  exp2 = read_csv("results_exp2.csv")
+) |> bind_rows(.id = "experiment") 
+
+```
+
+### Results
+
+Let's now evaluate this. As we saw in the slides, you can evaluate *spatially* or *textually*. Spatial evaluation consists of measuring the distance between the predicted and the actual location. Textual evaluation consists of checking if the predicted location matches the actual location.
+
+```{r evaluation_functions}
+# Data preprocessing and evaluation
+evaluation <- results |> 
+  mutate(
+    chosen_option = if_else(chosen_option == 'Bristol', 'Bristol, City of', chosen_option),
+    result = case_when(
+      local_authority_district == chosen_option ~ "Correct",
+      local_authority_district != chosen_option ~ "Incorrect"
+    )
+  )
+
+# Create a lookup table for experiment descriptions
+exp_descriptions <- tibble(
+  experiment = names(experiments),
+  description = map_chr(experiments, ~paste(.x, collapse = ", "))
+)
+
+# Classification accuracy table
+classification_results <- evaluation |> 
+  group_by(experiment, temperature) |>
+  summarise(
+    total = n(),
+    correct = sum(result == "Correct", na.rm = TRUE),
+    accuracy = round(correct / total, 3),
+    .groups = "drop"
+  ) |> 
+  left_join(exp_descriptions, by = "experiment") |> 
+  relocate(description, .after = experiment) |> 
+  select(-experiment)
+
+# Display results
+print(classification_results)
+```
+
+
+```{r}
+# Spatial evaluation with distance calculations
+spatial_results <- evaluation |>
+  left_join(
+    osm_with_districts_cands |> select(address, LAD24NM, latitude, longitude),
+    by = c('address', 'chosen_option' = 'LAD24NM')
+  ) |> 
+  distinct(address, chosen_option, start, end, temperature, experiment, .keep_all = TRUE) |>
+  rename(true_long = Longitude, true_lat = Latitude, pred_long = longitude, pred_lat = latitude) |>
+  rowwise() |>
+  mutate(
+    distance = if_else(
+      is.na(pred_long) | is.na(pred_lat), 
+      20039,  # Max distance for missing coordinates
+      geosphere::distHaversine(c(true_long, true_lat), c(pred_long, pred_lat)) / 1000
+    )
+  ) |>
+  ungroup()
+
+# Spatial metrics table
+spatial_metrics <- spatial_results |>
+  group_by(experiment, temperature) |>
+  summarise(
+    within_20km = round(mean(distance <= 20, na.rm = TRUE), 3),
+    within_161km = round(mean(distance <= 161, na.rm = TRUE), 3),
+    mean_distance = round(mean(distance, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+# Join with your spatial metrics
+spatial_metrics_labeled <- spatial_metrics |>
+  left_join(exp_descriptions, by = "experiment") |> 
+  relocate(description, .after = experiment) |> 
+  select(-experiment)
+
+print(spatial_metrics_labeled)
+```
+
+Our experiments yielded mixed results across different experimental configurations. The classification accuracy varied significantly depending on the included contextual fields and temperature settings.
+
+#### Where to go from here?
+These mixed results indicate substantial room for improvement through several approaches:
+
+*Model Selection:* A more sophisticated language model with better geographic knowledge and reasoning capabilities could significantly improve disambiguation accuracy.
+
+*Prompt Engineering:* More carefully crafted prompts that explicitly highlight geographic indicators and disambiguation strategies could enhance performance.
+
+*Enhanced Context:* Including or removing contextual information such as regional newspapers, local landmarks, or administrative hierarchies might improve results.
+
+*Thank you*
+Any questions or comments regarding this notebook, please let me know.
+**Contact:** s.bisiani\@surrey.ac.uk\
+**Code:** Available on [Github]()

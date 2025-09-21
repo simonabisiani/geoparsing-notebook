@@ -1,0 +1,23 @@
+project:
+  type: website
+  output-dir: docs   # GitHub Pages will serve from here
+
+website:
+  title: "LLMs for Toponym Disambiguation"
+  description: "Research project on using Large Language Models for toponym resolution in UK local media"
+
+  sidebar:
+    style: "docked"    # Sidebar always visible on the left
+    search: false      # No search bar
+    contents:
+      - live-coding-demo.qmd  # Your main notebook
+
+format:
+  html:
+    theme: cosmo       # Clean Bootstrap theme
+    toc: true          # Table of contents on the right
+    code-fold: true   # No "show/hide code" buttons
+    code-tools: false  # No extra code UI elements
+
+execute:
+  freeze: auto         # Cache results for faster re-renders
