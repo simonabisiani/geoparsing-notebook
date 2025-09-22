@@ -5,5 +5,5 @@ You can read more about the event [here](https://datamethodsinitiative.org/semin
 
 ## Resources
 
-- An [interactive notebook](https://github.com/simonabisiani/geoparsing-notebook) showing how to extract and disambiguate place names (toponyms) from UK local news articles.  
+- An [interactive notebook](https://simonabisiani.github.io/geoparsing-notebook) showing how to extract and disambiguate place names (toponyms) from UK local news articles.  
 - The [slides](https://github.com/simonabisiani/geoparsing-notebook/blob/main/slides.pdf) behind the lecture.
