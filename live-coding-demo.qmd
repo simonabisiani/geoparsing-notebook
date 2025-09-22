@@ -10,7 +10,7 @@ editor: visual
 
 ## Introduction
 
-Welcome to this live coding demonstration exploring **LLMs for Toponym Disambiguation** in UK local media. We will be using [LMUK-Geo](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/SGVXIU), a benchmark dataset we annotated for the purpose of testing geoparsing methods on British local news articles. We'll do the following:
+Welcome to this coding lesson exploring geoparsing of news articles. We will be using [LMUK-Geo](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/SGVXIU), a benchmark dataset we annotated for the purpose of testing geoparsing methods on British local news articles. We'll do the following:
 
 -   toponym recognition using *spaCy* in Python, to extract locations
 
@@ -19,6 +19,12 @@ Welcome to this live coding demonstration exploring **LLMs for Toponym Disambigu
 -   toponym resolution with *Ollama* and gemma2-9b model, to disambiguate
 
 As such, you'll get an overview of the full geoparsing pipeline, and get a sense of popular frameworks and common challenges.
+
+Here are the slides that accompany this notebook.
+
+<iframe src="slides.pdf" width="100%" height="400px" style="border:none;">
+</iframe>
+
 
 #### Setup: Loading Libraries
 
@@ -661,4 +667,4 @@ These mixed results indicate substantial room for improvement through several ap
 *Thank you*
 Any questions or comments regarding this notebook, please let me know.
 **Contact:** s.bisiani\@surrey.ac.uk\
-**Code:** Available on [Github]()
+**Code:** Available on [Github](https://github.com/simonabisiani/geoparsing-notebook)
